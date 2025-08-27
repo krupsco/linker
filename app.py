@@ -298,7 +298,14 @@ def process_text(full_text: str, temperature: float = 0.1) -> Tuple[str, Dict[st
 
 
 # ========== UI Streamlit ==========
+# ========== UI Streamlit ==========
 st.set_page_config(page_title="Obsidian Linker (PL)", page_icon="🧭", layout="wide")
+
+# pomocnicze (jeśli nie masz już w helpers)
+def slugify(name: str) -> str:
+    s = re.sub(r"[^\w\s-]", "", name, flags=re.UNICODE).strip().lower()
+    s = re.sub(r"[\s_-]+", "-", s)
+    return s or "podlinkowany"
 
 st.title("🧭 Obsidian Linker (PL)")
 st.caption("Automatyczne dodawanie linków [[ ]] (osoby, miejsca, wydarzenia) z aliasami w mianowniku — zgodnie z Twoją logiką.")
@@ -307,12 +314,9 @@ with st.sidebar:
     st.subheader("Ustawienia")
     temp = st.slider("Temperatura (0 = bardzo zachowawczo)", 0.0, 1.0, 0.1, 0.05, key="k_temp")
     st.divider()
-    st.markdown("**Model**")
-    st.code(MODEL)
-    st.markdown("**Limit chunku**")
-    st.code(f"{MAX_CHARS_PER_CHUNK} znaków")
-    st.markdown("**Overlap**")
-    st.code(f"{CHUNK_OVERLAP} znaków")
+    st.markdown("**Model**"); st.code(MODEL)
+    st.markdown("**Limit chunku**"); st.code(f"{MAX_CHARS_PER_CHUNK} znaków")
+    st.markdown("**Overlap**"); st.code(f"{CHUNK_OVERLAP} znaków")
     st.divider()
     st.markdown("🔐 Klucz OpenAI pobierany z `st.secrets['OPENAI_API_KEY']`.")
 
@@ -352,30 +356,32 @@ if run:
         st.error("Brak OPENAI_API_KEY. Uzupełnij `.streamlit/secrets.toml`.")
         st.stop()
 
-    # 1) wykryj sekcje
+    # 1) wykryj sekcje (wymaga: split_markdown_sections)
     sections = split_markdown_sections(input_text)
 
-    # 2) przetwórz – jeśli >=2 sekcje, robimy osobno każdą ze wspólną mapą encji
+    # 2) przetwarzanie
     section_results = []
     global_map: Dict[str, List[str]] = {}
 
     if len(sections) >= 2:
         st.info(f"Znaleziono {len(sections)} sekcje – zastosuję podział notatek i spójną mapę encji.")
-        # pasek postępu globalny dla wszystkich sekcji
+
+        # globalny progress (wymaga: count_total_chunks_multi)
         total_chunks = count_total_chunks_multi(sections)
         done_chunks = 0
         progress = st.progress(0, text="Start przetwarzania sekcji…")
 
         for idx, sec in enumerate(sections, start=1):
             st.write(f"**Sekcja {idx}/{len(sections)}:** {sec['title']}")
-            # przetwórz sekcję ze wspólną mapą
-            linked_text, global_map = process_text_with_map(sec["content"], temperature=temp, initial_map=global_map)
+            # przetwórz sekcję ze wspólną mapą (wymaga: process_text_with_map)
+            linked_text, global_map = process_text_with_map(
+                sec["content"], temperature=temp, initial_map=global_map
+            )
             section_results.append({
                 "title": sec["title"],
                 "slug": slugify(sec["title"]),
                 "content": linked_text
             })
-            # aktualizuj progres (na podstawie samego tekstu sekcji, by posuwać się do przodu)
             done_chunks += count_total_chunks(sec["content"])
             pct = int((done_chunks / max(total_chunks, 1)) * 100)
             progress.progress(min(pct, 100), text=f"Postęp: {pct}% ({idx}/{len(sections)})")
@@ -384,8 +390,6 @@ if run:
 
         # 3) „wszystko.md” = sklejone sekcje
         full_joined = "\n\n".join(s["content"] for s in section_results)
-
-        st.success("Gotowe! Poniżej propozycja podziału notatek i pobierania.")
 
         # nazwa całości
         if uploaded is not None and getattr(uploaded, "name", ""):
@@ -396,43 +400,53 @@ if run:
             head_line = head_line.lstrip("# ").strip()
             suggested_all = slugify(" ".join(head_line.split()[:6]) or "wszystko")
 
-        # 4) przyciski pobierania
-        st.markdown("### Pobierz całość")
+        st.success("Gotowe! Poniżej pobieranie plików.")
+
+        # --- CAŁOŚĆ (przycisk nad podglądem) ---
+        st.markdown("### Wynik: *wszystko* (`.md`)")
         st.download_button(
             "⬇️ Pobierz *wszystko* jako Markdown (.md)",
             data=full_joined.encode("utf-8"),
             file_name=f"{suggested_all}-wszystko.md",
-            mime="text/markdown"
+            mime="text/markdown",
+            key="k_download_all"
         )
+        # opcjonalny podgląd całości (jeśli chcesz)
+        st.text_area("Podlinkowany tekst (wszystko)", value=full_joined, height=300, key="k_output_text_all")
 
+        # --- SEK CJE OSOBNO ---
         st.markdown("### Pobierz sekcje osobno")
-        for s in section_results:
+        for i, s in enumerate(section_results, start=1):
+            st.write(f"**{i}. {s['title']}**")
             st.download_button(
-                f"⬇️ {s['title']}.md",
+                f"⬇️ Pobierz „{s['title']}”.md",
                 data=s["content"].encode("utf-8"),
                 file_name=f"{s['slug']}.md",
                 mime="text/markdown",
                 key=f"dl_{s['slug']}"
             )
+            # podgląd sekcji poniżej przycisku
+            with st.expander("Podgląd sekcji", expanded=False):
+                st.text_area("", value=s["content"], height=220, key=f"k_output_text_{i}")
 
-        # 5) ZIP z wszystkimi sekcjami
+        # --- ZIP ze wszystkim ---
         st.markdown("### Pobierz ZIP z wszystkimi sekcjami")
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for s in section_results:
                 zf.writestr(f"{s['slug']}.md", s["content"])
-            # dorzuć też „wszystko”
             zf.writestr(f"{suggested_all}-wszystko.md", full_joined)
         zip_buffer.seek(0)
         st.download_button(
             "📦 Pobierz wszystkie notatki jako ZIP",
             data=zip_buffer.getvalue(),
             file_name=f"{suggested_all}-notatki.zip",
-            mime="application/zip"
+            mime="application/zip",
+            key="k_download_zip"
         )
 
     else:
-        # tylko jedna sekcja – zachowujemy dotychczasowe zachowanie
+        # tylko jedna sekcja – standardowo
         linked_text, new_map = process_text(input_text, temperature=temp)
 
         # aktualizacja pamięci encji (w tle)
@@ -453,45 +467,20 @@ if run:
             suggested_name = slugify(" ".join(head_line.split()[:6]))
 
         st.success("Gotowe! Poniżej wynik.")
-        st.markdown("### Wynik (`.md`)")
-        st.text_area("Podlinkowany tekst", value=linked_text, height=320, key="k_output_text")
 
+        st.markdown("### Wynik (`.md`)")
+        # najpierw przycisk pobrania...
         st.download_button(
             "⬇️ Pobierz jako Markdown (.md)",
             data=linked_text.encode("utf-8"),
             file_name=f"{suggested_name}.md",
             mime="text/markdown",
-            key="k_download_single"   # ⬅️ unikalny key dla przycisku pobrania
+            key="k_download_single"
         )
-
-
-    # --- Ustal nazwę pliku wynikowego ---
-    def slugify(name: str) -> str:
-        s = re.sub(r"[^\w\s-]", "", name, flags=re.UNICODE).strip().lower()
-        s = re.sub(r"[\s_-]+", "-", s)
-        return s or "podlinkowany"
-
-    if uploaded is not None and getattr(uploaded, "name", ""):
-        base = uploaded.name.rsplit(".", 1)[0]
-        suggested_name = slugify(base)
-    else:
-        head_line = input_text.strip().splitlines()[0] if input_text.strip() else "podlinkowany"
-        head_line = head_line.lstrip("# ").strip()
-        suggested_name = slugify(" ".join(head_line.split()[:6]))
-
-    final_md = linked_text  # bez front matter
-
-    st.success("Gotowe! Poniżej wynik.")
-    st.markdown("### Wynik (`.md`)")
-    st.text_area("Podlinkowany tekst", value=linked_text, height=320)
-
-    st.download_button(
-        "⬇️ Pobierz jako Markdown (.md)",
-        data=final_md.encode("utf-8"),
-        file_name=f"{suggested_name}.md",
-        mime="text/markdown"
-    )
+        # ...potem podgląd tekstu
+        st.text_area("Podlinkowany tekst", value=linked_text, height=320, key="k_output_text_single")
 
 else:
     st.info("Ustaw parametry, wklej tekst i kliknij **Przetwórz**. "
             "Aplikacja doda linki i zadba o aliasy w mianowniku.")
+
