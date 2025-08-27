@@ -252,19 +252,22 @@ if sample:
         "W 1569 roku Unia lubelska wyznaczyła Warszawę i Zamek na stałe miejsce obrad sejmu."
     )
 
-input_text = st.text_area("Wklej tekst (.md/.txt, bez limitu długości – aplikacja pociągnie w częściach):",
-                          value=default_text, height=260)
+input_text = st.text_area(
+    "Wklej tekst (.md/.txt, bez limitu długości – aplikacja pociągnie w częściach):",
+    value=default_text, height=260
+)
 
 uploaded = st.file_uploader("…lub wgraj plik .md / .txt", type=["md", "txt"])
 if uploaded is not None:
     input_text = uploaded.read().decode("utf-8")
 
-colA, colB = st.columns([1,1])
+colA, colB = st.columns([1, 1])
 with colA:
     run = st.button("🚀 Przetwórz", type="primary")
 with colB:
     clear = st.button("🧹 Wyczyść pamięć encji tej sesji")
 
+# Pamięć encji trzymamy w tle (dla spójności), ale jej nie wyświetlamy
 if "known_entities_session" not in st.session_state or clear:
     st.session_state.known_entities_session = {}
 
@@ -276,10 +279,10 @@ if run:
         st.error("Brak OPENAI_API_KEY. Uzupełnij `.streamlit/secrets.toml`.")
         st.stop()
 
-    # Proces
+    # Przetwarzanie (z paskiem postępu w process_text, jeśli dodałeś)
     linked_text, new_map = process_text(input_text, temperature=temp)
 
-    # Zaktualizuj pamięć encji
+    # Aktualizacja pamięci encji (bez wyświetlania)
     for lemma, surfaces in new_map.items():
         if lemma not in st.session_state.known_entities_session:
             st.session_state.known_entities_session[lemma] = []
@@ -293,42 +296,27 @@ if run:
         s = re.sub(r"[\s_-]+", "-", s)
         return s or "podlinkowany"
 
-    suggested_name = "podlinkowany"
     if uploaded is not None and getattr(uploaded, "name", ""):
         base = uploaded.name.rsplit(".", 1)[0]
         suggested_name = slugify(base)
     else:
-        head = input_text.strip().splitlines()[0] if input_text.strip() else "podlinkowany"
-        head = head.lstrip("# ").strip()
-        suggested_name = slugify(" ".join(head.split()[:6]))
+        head_line = input_text.strip().splitlines()[0] if input_text.strip() else "podlinkowany"
+        head_line = head_line.lstrip("# ").strip()
+        suggested_name = slugify(" ".join(head_line.split()[:6]))
 
-    # Opcjonalny front matter
-    add_frontmatter = st.checkbox("Dołącz YAML front matter (title, created)", value=False)
-    front = ""
-    if add_frontmatter:
-        import datetime as _dt
-        front = (
-            f"---\n"
-            f'title: "{head}"\n'
-            f"created: {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"---\n\n"
-        )
+    final_md = linked_text  # bez front matter
 
-    final_md = f"{front}{linked_text}"
-
-    st.success("Gotowe! Poniżej wynik i mapa encji.")
+    st.success("Gotowe! Poniżej wynik.")
     st.markdown("### Wynik (`.md`)")
     st.text_area("Podlinkowany tekst", value=linked_text, height=320)
 
-    # Pobranie
-    st.download_button("⬇️ Pobierz jako Markdown (.md)",
-                       data=final_md.encode("utf-8"),
-                       file_name=f"{suggested_name}.md",
-                       mime="text/markdown")
-
-    st.markdown("### Mapa encji (dla spójności i debugowania)")
-    st.json(st.session_state.known_entities_session)
+    st.download_button(
+        "⬇️ Pobierz jako Markdown (.md)",
+        data=final_md.encode("utf-8"),
+        file_name=f"{suggested_name}.md",
+        mime="text/markdown"
+    )
 
 else:
     st.info("Ustaw parametry, wklej tekst i kliknij **Przetwórz**. "
-            "Aplikacja zadba o aliasy w mianowniku i spójność nazw w całym dokumencie.")
+            "Aplikacja doda linki i zadba o aliasy w mianowniku.")
