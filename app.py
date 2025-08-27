@@ -305,7 +305,7 @@ st.caption("Automatyczne dodawanie linków [[ ]] (osoby, miejsca, wydarzenia) z 
 
 with st.sidebar:
     st.subheader("Ustawienia")
-    temp = st.slider("Temperatura (0 = bardzo zachowawczo)", 0.0, 1.0, 0.1, 0.05)
+    temp = st.slider("Temperatura (0 = bardzo zachowawczo)", 0.0, 1.0, 0.1, 0.05, key="k_temp")
     st.divider()
     st.markdown("**Model**")
     st.code(MODEL)
@@ -317,7 +317,7 @@ with st.sidebar:
     st.markdown("🔐 Klucz OpenAI pobierany z `st.secrets['OPENAI_API_KEY']`.")
 
 st.markdown("### Wejście")
-sample = st.toggle("Wstaw przykładowy fragment", value=False)
+sample = st.toggle("Wstaw przykładowy fragment", value=False, key="k_sample_toggle")
 default_text = ""
 if sample:
     default_text = (
@@ -328,20 +328,19 @@ if sample:
 
 input_text = st.text_area(
     "Wklej tekst (.md/.txt, bez limitu długości – aplikacja pociągnie w częściach):",
-    value=default_text, height=260
+    value=default_text, height=260, key="k_input_text"
 )
 
-uploaded = st.file_uploader("…lub wgraj plik .md / .txt", type=["md", "txt"])
+uploaded = st.file_uploader("…lub wgraj plik .md / .txt", type=["md", "txt"], key="k_uploader")
 if uploaded is not None:
     input_text = uploaded.read().decode("utf-8")
 
 colA, colB = st.columns([1, 1])
 with colA:
-    run = st.button("🚀 Przetwórz", type="primary")
+    run = st.button("🚀 Przetwórz", type="primary", key="k_run")
 with colB:
-    clear = st.button("🧹 Wyczyść pamięć encji tej sesji")
+    clear = st.button("🧹 Wyczyść pamięć encji tej sesji", key="k_clear")
 
-# Pamięć encji trzymamy w tle (dla spójności), ale jej nie wyświetlamy
 if "known_entities_session" not in st.session_state or clear:
     st.session_state.known_entities_session = {}
 
@@ -455,13 +454,14 @@ if run:
 
         st.success("Gotowe! Poniżej wynik.")
         st.markdown("### Wynik (`.md`)")
-        st.text_area("Podlinkowany tekst", value=linked_text, height=320)
+        st.text_area("Podlinkowany tekst", value=linked_text, height=320, key="k_output_text")
 
         st.download_button(
             "⬇️ Pobierz jako Markdown (.md)",
             data=linked_text.encode("utf-8"),
             file_name=f"{suggested_name}.md",
-            mime="text/markdown"
+            mime="text/markdown",
+            key="k_download_single"   # ⬅️ unikalny key dla przycisku pobrania
         )
 
 
