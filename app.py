@@ -63,6 +63,16 @@ MARKDOWN_LINK_OR_IMAGE_RE = re.compile(r"(!?\[[^\]]*\]\([^)]+\))")
 
 
 # ========== Pomocnicze ==========
+
+def count_total_chunks(full_text: str) -> int:
+    segments = compound_protection(full_text)
+    total = 0
+    for seg, protected in segments:
+        if protected or not seg.strip():
+            continue
+        total += len(chunk_text_by_paragraphs(seg, MAX_CHARS_PER_CHUNK, CHUNK_OVERLAP))
+    return total
+    
 def split_keep_delimiters(text: str, pattern: re.Pattern) -> List[Tuple[str, bool]]:
     """
     Dzieli tekst na segmenty: [(segment, is_protected), ...]
@@ -177,10 +187,17 @@ def process_text(full_text: str, temperature: float = 0.1) -> Tuple[str, Dict[st
     - chunkujemy zwykłe segmenty
     - wywołujemy model per chunk z narastającą mapą encji
     - składamy wynik
+    - AKTUALIZUJEMY pasek postępu Streamlit
     """
     segments = compound_protection(full_text)
     known_entities: Dict[str, List[str]] = {}
     out_segments = []
+
+    # Pasek postępu (globalnie wszystkie chunki)
+    total_chunks = count_total_chunks(full_text)
+    done_chunks = 0
+    progress = st.progress(0, text="Przygotowuję…")
+    status_placeholder = st.empty()
 
     for seg, protected in segments:
         if protected or not seg.strip():
@@ -190,13 +207,20 @@ def process_text(full_text: str, temperature: float = 0.1) -> Tuple[str, Dict[st
         chunks = chunk_text_by_paragraphs(seg, MAX_CHARS_PER_CHUNK, CHUNK_OVERLAP)
         processed_parts = []
         for i, ch in enumerate(chunks, start=1):
-            with st.spinner(f"Przetwarzam segment ({i}/{len(chunks)})..."):
+            with st.spinner(f"Przetwarzam fragment {done_chunks + 1}/{total_chunks}…"):
                 linked, ents = call_openai_linker(ch, known_entities, temperature=temperature)
                 processed_parts.append(linked)
                 known_entities = update_known_entities(known_entities, ents)
+            done_chunks += 1
+            pct = int((done_chunks / max(total_chunks, 1)) * 100)
+            progress.progress(pct, text=f"Postęp: {pct}% ({done_chunks}/{total_chunks})")
+
         out_segments.append("".join(processed_parts))
 
+    progress.progress(100, text="Zakończono ✅")
+    status_placeholder.success("Przetwarzanie ukończone.")
     return "".join(out_segments), known_entities
+
 
 
 # ========== UI Streamlit ==========
