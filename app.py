@@ -224,46 +224,6 @@ def process_text(full_text: str, temperature: float = 0.1) -> Tuple[str, Dict[st
 
 
 # ========== UI Streamlit ==========
-
-# --- USTAL NAZWĘ PLIKU WYJŚCIOWEGO ---
-def slugify(name: str) -> str:
-    s = re.sub(r"[^\w\s-]", "", name, flags=re.UNICODE).strip().lower()
-    s = re.sub(r"[\s_-]+", "-", s)
-    return s or "podlinkowany"
-
-suggested_name = "podlinkowany"
-if uploaded is not None and getattr(uploaded, "name", ""):
-    base = uploaded.name.rsplit(".", 1)[0]
-    suggested_name = slugify(base)
-else:
-    # weź pierwszy nagłówek lub pierwsze 6 słów
-    head = input_text.strip().splitlines()[0] if input_text.strip() else "podlinkowany"
-    head = head.lstrip("# ").strip()
-    suggested_name = slugify(" ".join(head.split()[:6]))
-
-# Opcjonalny front matter
-add_frontmatter = st.checkbox("Dołącz YAML front matter (title, created)", value=False)
-front = ""
-if add_frontmatter:
-    import datetime as _dt
-    front = (
-        f"---\n"
-        f'title: "{head}"\n'
-        f"created: {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"---\n\n"
-    )
-
-final_md = f"{front}{linked_text}"
-
-# Pobranie jako .md
-st.download_button(
-    "⬇️ Pobierz jako Markdown (.md)",
-    data=final_md.encode("utf-8"),
-    file_name=f"{suggested_name}.md",
-    mime="text/markdown"
-)
-
-
 st.set_page_config(page_title="Obsidian Linker (PL)", page_icon="🧭", layout="wide")
 
 st.title("🧭 Obsidian Linker (PL)")
@@ -300,10 +260,8 @@ if uploaded is not None:
     input_text = uploaded.read().decode("utf-8")
 
 colA, colB = st.columns([1,1])
-
 with colA:
     run = st.button("🚀 Przetwórz", type="primary")
-
 with colB:
     clear = st.button("🧹 Wyczyść pamięć encji tej sesji")
 
@@ -321,7 +279,7 @@ if run:
     # Proces
     linked_text, new_map = process_text(input_text, temperature=temp)
 
-    # Zaktualizuj pamięć sesji (umożliwia spójność między kolejnymi przetworzeniami)
+    # Zaktualizuj pamięć encji
     for lemma, surfaces in new_map.items():
         if lemma not in st.session_state.known_entities_session:
             st.session_state.known_entities_session[lemma] = []
@@ -329,13 +287,44 @@ if run:
             if s not in st.session_state.known_entities_session[lemma]:
                 st.session_state.known_entities_session[lemma].append(s)
 
+    # --- Ustal nazwę pliku wynikowego ---
+    def slugify(name: str) -> str:
+        s = re.sub(r"[^\w\s-]", "", name, flags=re.UNICODE).strip().lower()
+        s = re.sub(r"[\s_-]+", "-", s)
+        return s or "podlinkowany"
+
+    suggested_name = "podlinkowany"
+    if uploaded is not None and getattr(uploaded, "name", ""):
+        base = uploaded.name.rsplit(".", 1)[0]
+        suggested_name = slugify(base)
+    else:
+        head = input_text.strip().splitlines()[0] if input_text.strip() else "podlinkowany"
+        head = head.lstrip("# ").strip()
+        suggested_name = slugify(" ".join(head.split()[:6]))
+
+    # Opcjonalny front matter
+    add_frontmatter = st.checkbox("Dołącz YAML front matter (title, created)", value=False)
+    front = ""
+    if add_frontmatter:
+        import datetime as _dt
+        front = (
+            f"---\n"
+            f'title: "{head}"\n'
+            f"created: {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"---\n\n"
+        )
+
+    final_md = f"{front}{linked_text}"
+
     st.success("Gotowe! Poniżej wynik i mapa encji.")
     st.markdown("### Wynik (`.md`)")
     st.text_area("Podlinkowany tekst", value=linked_text, height=320)
 
     # Pobranie
-    st.download_button("⬇️ Pobierz jako Markdown", data=linked_text.encode("utf-8"),
-                       file_name="podlinkowany.md", mime="text/markdown")
+    st.download_button("⬇️ Pobierz jako Markdown (.md)",
+                       data=final_md.encode("utf-8"),
+                       file_name=f"{suggested_name}.md",
+                       mime="text/markdown")
 
     st.markdown("### Mapa encji (dla spójności i debugowania)")
     st.json(st.session_state.known_entities_session)
