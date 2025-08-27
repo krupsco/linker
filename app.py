@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import zipfile
 from typing import Dict, List, Tuple
 
 import streamlit as st
@@ -63,6 +64,79 @@ MARKDOWN_LINK_OR_IMAGE_RE = re.compile(r"(!?\[[^\]]*\]\([^)]+\))")
 
 
 # ========== Pomocnicze ==========
+
+HDR_RE = re.compile(r"^(#{1,3})\s+(.+)$", flags=re.MULTILINE)
+
+def slugify(name: str) -> str:
+    s = re.sub(r"[^\w\s-]", "", name, flags=re.UNICODE).strip().lower()
+    s = re.sub(r"[\s_-]+", "-", s)
+    return s or "podlinkowany"
+
+def split_markdown_sections(text: str) -> List[Dict]:
+    """
+    Dzieli tekst po nagłówkach # / ## / ###.
+    Zwraca listę: [{"title": "...", "content": "..."}].
+    Jeżeli brak nagłówków -> 1 sekcja z tytułem z 1. linii albo z pierwszych słów.
+    """
+    positions = [(m.start(), m.group(1), m.group(2).strip()) for m in HDR_RE.finditer(text)]
+    sections = []
+    if not positions:
+        # brak nagłówków – jedna sekcja
+        head_line = text.strip().splitlines()[0] if text.strip() else "notatka"
+        title = head_line.lstrip("# ").strip()
+        if not title:
+            title = "notatka"
+        sections.append({"title": title, "content": text})
+        return sections
+
+    # z nagłówkami
+    positions.append((len(text), "", ""))  # sentinel
+    for i in range(len(positions)-1):
+        start, lvl, title = positions[i]
+        end, _, _ = positions[i+1]
+        block = text[start:end].rstrip()
+        # tytuł bez znaków #
+        title = title or "sekcja"
+        sections.append({"title": title, "content": block.strip() + "\n"})
+    return sections
+
+def count_total_chunks_multi(sections: List[Dict]) -> int:
+    total = 0
+    for s in sections:
+        total += count_total_chunks(s["content"])
+    return total
+
+def process_text_with_map(full_text: str, temperature: float, initial_map: Dict[str, List[str]]) -> Tuple[str, Dict[str, List[str]]]:
+    """
+    Wersja process_text, która startuje ze wstępną mapą encji (dla globalnej spójności).
+    """
+    segments = compound_protection(full_text)
+    known_entities: Dict[str, List[str]] = {k: list(v) for k, v in (initial_map or {}).items()}
+    out_segments = []
+
+    total_chunks = count_total_chunks(full_text)
+    done_chunks = 0
+    progress = st.progress(0, text="Przygotowuję…")
+
+    for seg, protected in segments:
+        if protected or not seg.strip():
+            out_segments.append(seg)
+            continue
+        chunks = chunk_text_by_paragraphs(seg, MAX_CHARS_PER_CHUNK, CHUNK_OVERLAP)
+        processed_parts = []
+        for ch in chunks:
+            with st.spinner(f"Przetwarzam fragment {done_chunks + 1}/{total_chunks}…"):
+                linked, ents = call_openai_linker(ch, known_entities, temperature=temperature)
+                processed_parts.append(linked)
+                known_entities = update_known_entities(known_entities, ents)
+            done_chunks += 1
+            pct = int((done_chunks / max(total_chunks, 1)) * 100)
+            progress.progress(pct, text=f"Postęp: {pct}% ({done_chunks}/{total_chunks})")
+        out_segments.append("".join(processed_parts))
+
+    progress.progress(100, text="Zakończono ✅")
+    return "".join(out_segments), known_entities
+
 
 def count_total_chunks(full_text: str) -> int:
     segments = compound_protection(full_text)
@@ -279,16 +353,117 @@ if run:
         st.error("Brak OPENAI_API_KEY. Uzupełnij `.streamlit/secrets.toml`.")
         st.stop()
 
-    # Przetwarzanie (z paskiem postępu w process_text, jeśli dodałeś)
-    linked_text, new_map = process_text(input_text, temperature=temp)
+    # 1) wykryj sekcje
+    sections = split_markdown_sections(input_text)
 
-    # Aktualizacja pamięci encji (bez wyświetlania)
-    for lemma, surfaces in new_map.items():
-        if lemma not in st.session_state.known_entities_session:
-            st.session_state.known_entities_session[lemma] = []
-        for s in surfaces:
-            if s not in st.session_state.known_entities_session[lemma]:
-                st.session_state.known_entities_session[lemma].append(s)
+    # 2) przetwórz – jeśli >=2 sekcje, robimy osobno każdą ze wspólną mapą encji
+    section_results = []
+    global_map: Dict[str, List[str]] = {}
+
+    if len(sections) >= 2:
+        st.info(f"Znaleziono {len(sections)} sekcje – zastosuję podział notatek i spójną mapę encji.")
+        # pasek postępu globalny dla wszystkich sekcji
+        total_chunks = count_total_chunks_multi(sections)
+        done_chunks = 0
+        progress = st.progress(0, text="Start przetwarzania sekcji…")
+
+        for idx, sec in enumerate(sections, start=1):
+            st.write(f"**Sekcja {idx}/{len(sections)}:** {sec['title']}")
+            # przetwórz sekcję ze wspólną mapą
+            linked_text, global_map = process_text_with_map(sec["content"], temperature=temp, initial_map=global_map)
+            section_results.append({
+                "title": sec["title"],
+                "slug": slugify(sec["title"]),
+                "content": linked_text
+            })
+            # aktualizuj progres (na podstawie samego tekstu sekcji, by posuwać się do przodu)
+            done_chunks += count_total_chunks(sec["content"])
+            pct = int((done_chunks / max(total_chunks, 1)) * 100)
+            progress.progress(min(pct, 100), text=f"Postęp: {pct}% ({idx}/{len(sections)})")
+
+        progress.progress(100, text="Wszystkie sekcje przetworzone ✅")
+
+        # 3) „wszystko.md” = sklejone sekcje
+        full_joined = "\n\n".join(s["content"] for s in section_results)
+
+        st.success("Gotowe! Poniżej propozycja podziału notatek i pobierania.")
+
+        # nazwa całości
+        if uploaded is not None and getattr(uploaded, "name", ""):
+            base = uploaded.name.rsplit(".", 1)[0]
+            suggested_all = slugify(base)
+        else:
+            head_line = input_text.strip().splitlines()[0] if input_text.strip() else "wszystko"
+            head_line = head_line.lstrip("# ").strip()
+            suggested_all = slugify(" ".join(head_line.split()[:6]) or "wszystko")
+
+        # 4) przyciski pobierania
+        st.markdown("### Pobierz całość")
+        st.download_button(
+            "⬇️ Pobierz *wszystko* jako Markdown (.md)",
+            data=full_joined.encode("utf-8"),
+            file_name=f"{suggested_all}-wszystko.md",
+            mime="text/markdown"
+        )
+
+        st.markdown("### Pobierz sekcje osobno")
+        for s in section_results:
+            st.download_button(
+                f"⬇️ {s['title']}.md",
+                data=s["content"].encode("utf-8"),
+                file_name=f"{s['slug']}.md",
+                mime="text/markdown",
+                key=f"dl_{s['slug']}"
+            )
+
+        # 5) ZIP z wszystkimi sekcjami
+        st.markdown("### Pobierz ZIP z wszystkimi sekcjami")
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for s in section_results:
+                zf.writestr(f"{s['slug']}.md", s["content"])
+            # dorzuć też „wszystko”
+            zf.writestr(f"{suggested_all}-wszystko.md", full_joined)
+        zip_buffer.seek(0)
+        st.download_button(
+            "📦 Pobierz wszystkie notatki jako ZIP",
+            data=zip_buffer.getvalue(),
+            file_name=f"{suggested_all}-notatki.zip",
+            mime="application/zip"
+        )
+
+    else:
+        # tylko jedna sekcja – zachowujemy dotychczasowe zachowanie
+        linked_text, new_map = process_text(input_text, temperature=temp)
+
+        # aktualizacja pamięci encji (w tle)
+        for lemma, surfaces in new_map.items():
+            if lemma not in st.session_state.known_entities_session:
+                st.session_state.known_entities_session[lemma] = []
+            for s in surfaces:
+                if s not in st.session_state.known_entities_session[lemma]:
+                    st.session_state.known_entities_session[lemma].append(s)
+
+        # nazwa pliku
+        if uploaded is not None and getattr(uploaded, "name", ""):
+            base = uploaded.name.rsplit(".", 1)[0]
+            suggested_name = slugify(base)
+        else:
+            head_line = input_text.strip().splitlines()[0] if input_text.strip() else "podlinkowany"
+            head_line = head_line.lstrip("# ").strip()
+            suggested_name = slugify(" ".join(head_line.split()[:6]))
+
+        st.success("Gotowe! Poniżej wynik.")
+        st.markdown("### Wynik (`.md`)")
+        st.text_area("Podlinkowany tekst", value=linked_text, height=320)
+
+        st.download_button(
+            "⬇️ Pobierz jako Markdown (.md)",
+            data=linked_text.encode("utf-8"),
+            file_name=f"{suggested_name}.md",
+            mime="text/markdown"
+        )
+
 
     # --- Ustal nazwę pliku wynikowego ---
     def slugify(name: str) -> str:
