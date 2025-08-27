@@ -13,7 +13,7 @@ except ImportError:
     st.stop()
 
 # ========== Konfiguracja ==========
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # 🚀 szybszy model
 MAX_CHARS_PER_CHUNK = 6500   # bezpieczny limit na chunk (przybliżenie)
 CHUNK_OVERLAP = 200          # miękkie „zakładki” między chunkami
 
