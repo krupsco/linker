@@ -2,6 +2,8 @@ import os
 import re
 import io
 import json
+import time
+import random
 import zipfile
 from typing import Dict, List, Tuple, Optional
 
@@ -10,14 +12,24 @@ import streamlit as st
 # --- OpenAI SDK (>=1.0) ---
 try:
     from openai import OpenAI
+    from openai import RateLimitError, APIError, APIConnectionError
 except ImportError:
     st.error("Brak pakietu 'openai'. Upewnij się, że jest w requirements.txt")
     st.stop()
+except Exception:
+    # Fallback, jeśli nie ma klas wyjątków w danej wersji
+    RateLimitError = APIError = APIConnectionError = Exception
 
 # ========== Konfiguracja ==========
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # 🚀 szybszy model
-MAX_CHARS_PER_CHUNK = 6500   # bezpieczny limit na chunk (przybliżenie)
-CHUNK_OVERLAP = 200          # miękkie „zakładki” między chunkami
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")  # 🚀 szybki model
+# Mniej requestów = mniejsze ryzyko 429; dzielimy po akapitach, więc to bezpieczne
+MAX_CHARS_PER_CHUNK = int(os.getenv("MAX_CHARS_PER_CHUNK", "9000"))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
+
+# Delikatny throttling po każdym zapytaniu (sekundy)
+THROTTLE_SLEEP = float(os.getenv("OPENAI_THROTTLE_S", "0.2"))
+# Ile razy ponawiać w razie RateLimit/5xx
+MAX_RETRY_ATTEMPTS = int(os.getenv("OPENAI_MAX_RETRY", "6"))
 
 # Pobranie klucza z secrets Streamlita
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
@@ -59,7 +71,6 @@ i JSON z listą wykrytych/aktualizowanych bytów (pole "entities": [{surface, le
 KNOWN_ENTITIES (priorytet spójności):
 """
 
-# Prompt do minimalnej korekty OCR/PDF (bez redakcji merytorycznej/stylowej)
 SYSTEM_PROMPT_OCR = """Jesteś asystentem do minimalnej korekty tekstu po OCR/PDF w języku polskim.
 Twoje zadanie: usunąć wyłącznie ARTEFAKTY formatowania, zachowując treść i styl bez redakcji merytorycznej.
 Ściśle stosuj poniższe zasady:
@@ -80,24 +91,17 @@ ZWROT:
 """
 
 # ========== Wzorce i ochrona fragmentów ==========
-
-# bloki kodu / inline code
-FENCE_RE = re.compile(r"(```.*?```|`.*?`)", re.DOTALL)
-# obrazy i linki markdown (![]() i []())
-MARKDOWN_LINK_OR_IMAGE_RE = re.compile(r"(!?\[[^\]]*\]\([^)]+\))")
-# nagłówki h1–h3
-HDR_RE = re.compile(r"^(#{1,3})\s+(.+)$", flags=re.MULTILINE)
+FENCE_RE = re.compile(r"(```.*?```|`.*?`)", re.DOTALL)  # bloki kodu / inline code
+MARKDOWN_LINK_OR_IMAGE_RE = re.compile(r"(!?\[[^\]]*\]\([^)]+\))")  # obrazy i linki markdown
+HDR_RE = re.compile(r"^(#{1,3})\s+(.+)$", flags=re.MULTILINE)  # nagłówki h1–h3
 
 # --- Rozpoznawanie osób: wzorce ---
-# np. "J. Kowalski", "M. K. Pawlikowska" (obsługa 1–2 inicjałów)
 INITIAL_PERSON_RE = re.compile(
     r"\b([A-ZŁŚŻŹĆŃÓ])\.\s*(?:([A-ZŁŚŻŹĆŃÓ])\.\s*)?([A-ZŁŚŻŹĆŃÓ][a-ząćęłńóśżź-]+)\b"
 )
-# np. "Kowalski Tytuł (1953)", "Kowalska (1999)" – wzorzec cytowania
 CITATION_SURNAME_YEAR_RE = re.compile(
     r"\b([A-ZŁŚŻŹĆŃÓ][a-ząćęłńóśżź-]+)\b[^()\n]{0,80}?\(\s*(\d{4}[a-z]?)\s*\)"
 )
-
 
 # ========== Pomocnicze ==========
 
@@ -107,11 +111,6 @@ def slugify(name: str) -> str:
     return s or "podlinkowany"
 
 def split_markdown_sections(text: str) -> List[Dict]:
-    """
-    Dzieli tekst po nagłówkach # / ## / ###.
-    Zwraca listę: [{"title": "...", "content": "..."}].
-    Jeżeli brak nagłówków -> 1 sekcja z tytułem z 1. linii albo z pierwszych słów.
-    """
     positions = [(m.start(), m.group(1), m.group(2).strip()) for m in HDR_RE.finditer(text)]
     sections = []
     if not positions:
@@ -130,10 +129,6 @@ def split_markdown_sections(text: str) -> List[Dict]:
     return sections
 
 def split_keep_delimiters(text: str, pattern: re.Pattern) -> List[Tuple[str, bool]]:
-    """
-    Zwraca listę segmentów [(segment, is_protected)], gdzie is_protected=True oznacza,
-    że fragmentu nie modyfikujemy (np. kod, link MD).
-    """
     protected = []
     last = 0
     for m in pattern.finditer(text):
@@ -146,7 +141,6 @@ def split_keep_delimiters(text: str, pattern: re.Pattern) -> List[Tuple[str, boo
     return protected
 
 def compound_protection(text: str) -> List[Tuple[str, bool]]:
-    """Zabezpiecza bloki kodu i konstrukcje linków/obrazków Markdown."""
     segs = split_keep_delimiters(text, FENCE_RE)
     out = []
     for seg, prot in segs:
@@ -192,19 +186,49 @@ def count_total_chunks_multi(sections: List[Dict]) -> int:
         total += count_total_chunks(s["content"])
     return total
 
+# --- Helper: wywołanie API z retry + backoff ---
+def _chat_with_retry(messages, model, temperature=0.0,
+                     max_attempts: int = MAX_RETRY_ATTEMPTS):
+    """
+    Wywołanie /chat/completions z wykładniczym backoffem.
+    Ponawiamy na RateLimit, 429, 5xx, błędy połączeń.
+    """
+    for attempt in range(max_attempts):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                messages=messages
+            )
+            if THROTTLE_SLEEP > 0:
+                time.sleep(THROTTLE_SLEEP)
+            return resp
+        except (RateLimitError, APIConnectionError, APIError) as e:
+            if attempt == max_attempts - 1:
+                raise
+            emsg = str(e)
+            retriable = (
+                isinstance(e, RateLimitError)
+                or "rate limit" in emsg.lower()
+                or "429" in emsg
+                or "500" in emsg
+                or "502" in emsg
+                or "503" in emsg
+                or "504" in emsg
+                or "temporarily unavailable" in emsg.lower()
+            )
+            if not retriable:
+                raise
+            delay = min(16.0, (2 ** attempt)) + random.uniform(0.0, 0.5)
+            st.caption(f"⏳ API ogranicza ruch (próba {attempt+1}/{max_attempts}). Pauza {delay:.1f}s…")
+            time.sleep(delay)
 
 # ========== Rozpoznawanie osób (inicjały / cytowania) ==========
 
 def extract_person_candidates(text: str) -> List[Dict[str, str]]:
-    """
-    Zwraca listę kandydatów do rozwinięcia imienia:
-    - {'surface': 'J. Kowalski', 'type': 'initial', 'surname': 'Kowalski'}
-    - {'surface': 'Kowalski', 'year': '1953', 'type': 'citation'}
-    Brak duplikatów.
-    """
     found = {}
     for m in INITIAL_PERSON_RE.finditer(text):
-        ini1, ini2, surname = m.groups()
+        _, _, surname = m.groups()
         surface = m.group(0)
         key = ("initial", surface)
         if key not in found:
@@ -222,11 +246,8 @@ def extract_person_candidates(text: str) -> List[Dict[str, str]]:
 def call_openai_person_resolver(context_text: str, candidates: List[Dict[str, str]]) -> Dict[str, Dict[str, str]]:
     """
     Zwraca mapę:
-    {
-      'J. Kowalski': {'lemma': 'Jan Kowalski', 'confidence': 0.86},
-      'Kowalski|1953': {'lemma': 'Jan Kowalski', 'confidence': 0.74}
-    }
-    Jeżeli niepewne (<0.5) – wpis nie jest zwracany.
+      'J. Kowalski'   -> {'lemma': 'Jan Kowalski', 'confidence': 0.86}
+      'Kowalski|1953' -> {'lemma': 'Jan Kowalski', 'confidence': 0.74}
     """
     if not candidates:
         return {}
@@ -244,10 +265,11 @@ def call_openai_person_resolver(context_text: str, candidates: List[Dict[str, st
     )
     user = "KONTEXT:\n" + context_text[:12000] + "\n\nLISTA WZMIANEK:\n" + json.dumps(candidates, ensure_ascii=False)
 
-    resp = client.chat.completions.create(
+    resp = _chat_with_retry(
+        messages=[{"role": "system", "content": sys},
+                  {"role": "user", "content": user}],
         model=MODEL,
-        temperature=0.0,
-        messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}]
+        temperature=0.0
     )
     try:
         data = json.loads(resp.choices[0].message.content)
@@ -264,7 +286,6 @@ def call_openai_person_resolver(context_text: str, candidates: List[Dict[str, st
         return out
     except Exception:
         return {}
-
 
 # ========== Wezwania do OpenAI: linkowanie i OCR ==========
 
@@ -285,7 +306,6 @@ def call_openai_linker(
         else:
             known_list.append({"lemma": lemma, "surfaces": [surfaces]})
 
-    # wstrzyknięcie zasad dla osób
     person_rules = []
     if person_map:
         for k, v in person_map.items():
@@ -314,11 +334,7 @@ def call_openai_linker(
         {"role": "system", "content": sys},
         {"role": "user", "content": raw_text}
     ]
-    resp = client.chat.completions.create(
-        model=MODEL,
-        temperature=temperature,
-        messages=messages
-    )
+    resp = _chat_with_retry(messages, model=MODEL, temperature=temperature)
     content = resp.choices[0].message.content
 
     if "-----ENTITY_MAP_JSON-----" in content and "-----END-----" in content:
@@ -338,13 +354,8 @@ def call_openai_cleaner(raw_text: str, temperature: float = 0.0) -> str:
         {"role": "system", "content": SYSTEM_PROMPT_OCR},
         {"role": "user", "content": raw_text}
     ]
-    resp = client.chat.completions.create(
-        model=MODEL,
-        temperature=temperature,
-        messages=messages
-    )
+    resp = _chat_with_retry(messages, model=MODEL, temperature=temperature)
     return resp.choices[0].message.content.strip()
-
 
 # ========== Pipeline'y ==========
 
@@ -408,7 +419,6 @@ def process_text_with_map(full_text: str, temperature: float, initial_map: Dict[
             out_segments.append(seg)
             continue
 
-        # Rozpoznanie osób na bazie całego segmentu
         persons = call_openai_person_resolver(seg, extract_person_candidates(seg))
 
         chunks = chunk_text_by_paragraphs(seg, MAX_CHARS_PER_CHUNK, CHUNK_OVERLAP)
@@ -447,7 +457,6 @@ def process_text(full_text: str, temperature: float = 0.1) -> Tuple[str, Dict[st
             out_segments.append(seg)
             continue
 
-        # Rozpoznanie osób dla segmentu
         persons = call_openai_person_resolver(seg, extract_person_candidates(seg))
 
         chunks = chunk_text_by_paragraphs(seg, MAX_CHARS_PER_CHUNK, CHUNK_OVERLAP)
@@ -475,13 +484,12 @@ def process_text(full_text: str, temperature: float = 0.1) -> Tuple[str, Dict[st
 st.set_page_config(page_title="Obsidian Linker (PL)", page_icon="🧭", layout="wide")
 
 st.title("🧭 Obsidian Linker (PL)")
-st.caption("Automatyczne dodawanie linków [[ ]] i (opcjonalnie) minimalne czyszczenie artefaktów OCR/PDF + rozpoznawanie osób (inicjały/cytowania).")
+st.caption("Automatyczne dodawanie linków [[ ]] • minimalne czyszczenie artefaktów OCR/PDF • rozpoznawanie osób z inicjałów i cytowań „Nazwisko (rok)”.\nZ wbudowanym retry/backoff na limity API.")
 
 with st.sidebar:
     st.subheader("Ustawienia")
     temp = st.slider("Temperatura (0 = bardzo zachowawczo)", 0.0, 1.0, 0.1, 0.05, key="k_temp")
 
-    # Tryb przetwarzania
     st.divider()
     mode = st.radio(
         "Tryb przetwarzania",
@@ -498,6 +506,8 @@ with st.sidebar:
     st.markdown("**Model**"); st.code(MODEL)
     st.markdown("**Limit chunku**"); st.code(f"{MAX_CHARS_PER_CHUNK} znaków")
     st.markdown("**Overlap**"); st.code(f"{CHUNK_OVERLAP} znaków")
+    st.markdown("**Throttle**"); st.code(f"{THROTTLE_SLEEP}s / request")
+    st.markdown("**Max retry**"); st.code(f"{MAX_RETRY_ATTEMPTS}")
     st.divider()
     st.markdown("🔐 Klucz OpenAI pobierany z `st.secrets['OPENAI_API_KEY']`.")
 
@@ -538,12 +548,10 @@ if run:
         st.error("Brak OPENAI_API_KEY. Uzupełnij `.streamlit/secrets.toml`.")
         st.stop()
 
-    # 1) wykryj sekcje
     sections = split_markdown_sections(input_text)
 
-    # 2) przetwarzanie wg trybu
     if len(sections) >= 2:
-        st.info(f"Znaleziono {len(sections)} sekcje – zastosuję podział notatek.")
+        st.info(f"Znaleziono {len(sekcji:=len(sections))} sekcje – zastosuję podział notatek.")
         total_chunks = count_total_chunks_multi(sections)
         done_chunks = 0
         progress = st.progress(0, text="Start przetwarzania sekcji…")
@@ -552,7 +560,7 @@ if run:
         global_map: Dict[str, List[str]] = {}
 
         for idx, sec in enumerate(sections, start=1):
-            st.write(f"**Sekcja {idx}/{len(sections)}:** {sec['title']}")
+            st.write(f"**Sekcja {idx}/{len(sekcji)}:** {sec['title']}")
             sec_content = sec["content"]
 
             if mode == "Oczyść OCR/PDF (minimalnie)":
@@ -584,14 +592,12 @@ if run:
 
             done_chunks += count_total_chunks(sec["content"])
             pct = int((done_chunks / max(total_chunks, 1)) * 100)
-            progress.progress(min(pct, 100), text=f"Postęp: {pct}% ({idx}/{len(sections)})")
+            progress.progress(min(pct, 100), text=f"Postęp: {pct}% ({idx}/{len(sekcji)})")
 
         progress.progress(100, text="Wszystkie sekcje przetworzone ✅")
 
-        # 3) „wszystko.md” = sklejone sekcje
         full_joined = "\n\n".join(s["content"] for s in section_results)
 
-        # nazwa całości
         if uploaded is not None and getattr(uploaded, "name", ""):
             base = uploaded.name.rsplit(".", 1)[0]
             suggested_all = slugify(base)
@@ -641,7 +647,6 @@ if run:
         )
 
     else:
-        # tylko jedna sekcja – standardowo
         work_text = input_text
 
         if mode == "Oczyść OCR/PDF (minimalnie)":
@@ -653,7 +658,6 @@ if run:
         else:  # "Dodaj linki [[…]]"
             result_text, new_map = process_text(work_text, temperature=temp)
 
-        # aktualizacja pamięci encji (jeżeli była mapa)
         for lemma, surfaces in new_map.items():
             if lemma not in st.session_state.known_entities_session:
                 st.session_state.known_entities_session[lemma] = []
@@ -661,7 +665,6 @@ if run:
                 if s not in st.session_state.known_entities_session[lemma]:
                     st.session_state.known_entities_session[lemma].append(s)
 
-        # nazwa pliku
         if uploaded is not None and getattr(uploaded, "name", ""):
             base = uploaded.name.rsplit(".", 1)[0]
             suggested_name = slugify(base)
@@ -672,7 +675,6 @@ if run:
 
         st.success("Gotowe! Poniżej wynik.")
         st.markdown("### Wynik (`.md`)")
-
         st.download_button(
             "⬇️ Pobierz jako Markdown (.md)",
             data=result_text.encode("utf-8"),
@@ -684,4 +686,4 @@ if run:
 
 else:
     st.info("Ustaw parametry, wklej tekst i kliknij **Przetwórz**. "
-            "Aplikacja doda linki i/lub minimalnie oczyści artefakty OCR/PDF. Rozpoznaje także osoby z inicjałów i cytowań „Nazwisko (rok)”.")
+            "Aplikacja doda linki i/lub minimalnie oczyści artefakty OCR/PDF oraz rozpozna osoby z inicjałów / cytowań.")
