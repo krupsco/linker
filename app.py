@@ -3,7 +3,7 @@ import re
 import io
 import json
 import zipfile
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import streamlit as st
 
@@ -59,7 +59,7 @@ i JSON z listą wykrytych/aktualizowanych bytów (pole "entities": [{surface, le
 KNOWN_ENTITIES (priorytet spójności):
 """
 
-# ➕ NOWE: Prompt do minimalnej korekty OCR/PDF (bez redakcji merytorycznej/stylowej)
+# Prompt do minimalnej korekty OCR/PDF (bez redakcji merytorycznej/stylowej)
 SYSTEM_PROMPT_OCR = """Jesteś asystentem do minimalnej korekty tekstu po OCR/PDF w języku polskim.
 Twoje zadanie: usunąć wyłącznie ARTEFAKTY formatowania, zachowując treść i styl bez redakcji merytorycznej.
 Ściśle stosuj poniższe zasady:
@@ -79,14 +79,27 @@ ZWROT:
 - Zwróć WYŁĄCZNIE oczyszczony tekst (bez dodatkowych komentarzy).
 """
 
-# typowa heurystyka wykrywania bloków kodu/obrazków/linków: nie zmieniamy ich
+# ========== Wzorce i ochrona fragmentów ==========
+
+# bloki kodu / inline code
 FENCE_RE = re.compile(r"(```.*?```|`.*?`)", re.DOTALL)
+# obrazy i linki markdown (![]() i []())
 MARKDOWN_LINK_OR_IMAGE_RE = re.compile(r"(!?\[[^\]]*\]\([^)]+\))")
+# nagłówki h1–h3
+HDR_RE = re.compile(r"^(#{1,3})\s+(.+)$", flags=re.MULTILINE)
+
+# --- Rozpoznawanie osób: wzorce ---
+# np. "J. Kowalski", "M. K. Pawlikowska" (obsługa 1–2 inicjałów)
+INITIAL_PERSON_RE = re.compile(
+    r"\b([A-ZŁŚŻŹĆŃÓ])\.\s*(?:([A-ZŁŚŻŹĆŃÓ])\.\s*)?([A-ZŁŚŻŹĆŃÓ][a-ząćęłńóśżź-]+)\b"
+)
+# np. "Kowalski Tytuł (1953)", "Kowalska (1999)" – wzorzec cytowania
+CITATION_SURNAME_YEAR_RE = re.compile(
+    r"\b([A-ZŁŚŻŹĆŃÓ][a-ząćęłńóśżź-]+)\b[^()\n]{0,80}?\(\s*(\d{4}[a-z]?)\s*\)"
+)
 
 
 # ========== Pomocnicze ==========
-
-HDR_RE = re.compile(r"^(#{1,3})\s+(.+)$", flags=re.MULTILINE)
 
 def slugify(name: str) -> str:
     s = re.sub(r"[^\w\s-]", "", name, flags=re.UNICODE).strip().lower()
@@ -116,16 +129,10 @@ def split_markdown_sections(text: str) -> List[Dict]:
         sections.append({"title": title, "content": block.strip() + "\n"})
     return sections
 
-def count_total_chunks_multi(sections: List[Dict]) -> int:
-    total = 0
-    for s in sections:
-        total += count_total_chunks(s["content"])
-    return total
-
 def split_keep_delimiters(text: str, pattern: re.Pattern) -> List[Tuple[str, bool]]:
     """
-    Dzieli tekst na segmenty: [(segment, is_protected), ...]
-    is_protected=True oznacza fragment, którego nie modyfikujemy (np. kod, link MD).
+    Zwraca listę segmentów [(segment, is_protected)], gdzie is_protected=True oznacza,
+    że fragmentu nie modyfikujemy (np. kod, link MD).
     """
     protected = []
     last = 0
@@ -139,7 +146,7 @@ def split_keep_delimiters(text: str, pattern: re.Pattern) -> List[Tuple[str, boo
     return protected
 
 def compound_protection(text: str) -> List[Tuple[str, bool]]:
-    """Zabezpiecza jednocześnie bloki kodu i konstrukcje linków/obrazków Markdown."""
+    """Zabezpiecza bloki kodu i konstrukcje linków/obrazków Markdown."""
     segs = split_keep_delimiters(text, FENCE_RE)
     out = []
     for seg, prot in segs:
@@ -170,13 +177,106 @@ def chunk_text_by_paragraphs(text: str, max_chars: int, overlap: int) -> List[st
         chunks.append("".join(cur))
     return chunks
 
+def count_total_chunks(full_text: str) -> int:
+    segments = compound_protection(full_text)
+    total = 0
+    for seg, protected in segments:
+        if protected or not seg.strip():
+            continue
+        total += len(chunk_text_by_paragraphs(seg, MAX_CHARS_PER_CHUNK, CHUNK_OVERLAP))
+    return total
 
-# ========== Wezwania do OpenAI ==========
+def count_total_chunks_multi(sections: List[Dict]) -> int:
+    total = 0
+    for s in sections:
+        total += count_total_chunks(s["content"])
+    return total
 
-def call_openai_linker(raw_text: str, known_entities: Dict[str, List[str]], temperature: float = 0.1) -> Tuple[str, List[Dict]]:
+
+# ========== Rozpoznawanie osób (inicjały / cytowania) ==========
+
+def extract_person_candidates(text: str) -> List[Dict[str, str]]:
+    """
+    Zwraca listę kandydatów do rozwinięcia imienia:
+    - {'surface': 'J. Kowalski', 'type': 'initial', 'surname': 'Kowalski'}
+    - {'surface': 'Kowalski', 'year': '1953', 'type': 'citation'}
+    Brak duplikatów.
+    """
+    found = {}
+    for m in INITIAL_PERSON_RE.finditer(text):
+        ini1, ini2, surname = m.groups()
+        surface = m.group(0)
+        key = ("initial", surface)
+        if key not in found:
+            found[key] = {"surface": surface, "type": "initial", "surname": surname}
+
+    for m in CITATION_SURNAME_YEAR_RE.finditer(text):
+        surname, year = m.groups()
+        surface = surname
+        key = ("citation", surface, year)
+        if key not in found:
+            found[key] = {"surface": surface, "type": "citation", "year": year}
+
+    return list(found.values())
+
+def call_openai_person_resolver(context_text: str, candidates: List[Dict[str, str]]) -> Dict[str, Dict[str, str]]:
+    """
+    Zwraca mapę:
+    {
+      'J. Kowalski': {'lemma': 'Jan Kowalski', 'confidence': 0.86},
+      'Kowalski|1953': {'lemma': 'Jan Kowalski', 'confidence': 0.74}
+    }
+    Jeżeli niepewne (<0.5) – wpis nie jest zwracany.
+    """
+    if not candidates:
+        return {}
+
+    sys = (
+        "Jesteś asystentem-bibliografem. Na podstawie KONTEXTU i LISTY WZMIANEK rozwiń inicjały "
+        "i nazwiska do pełnego imienia i nazwiska w języku polskim (jeśli znane powszechnie) "
+        "lub najbardziej prawdopodobnej formy wynikającej z kontekstu.\n"
+        "Zwróć TYLKO JSON w formacie:\n"
+        "{ 'items': [ {'surface': 'J. Kowalski', 'year': null, 'lemma': 'Jan Kowalski', 'confidence': 0.88}, ... ] }\n"
+        "Zasady:\n"
+        "- Nie zgaduj bez podstaw; jeśli pewność < 0.5, wpisz 'confidence': 0.0 i/lub pomiń.\n"
+        "- Dla cytowań typu 'Nazwisko ... (rok)' ustaw year, np. '1953'.\n"
+        "- Nie dopisuj stopni/tytułów. Tylko pełne 'Imię Nazwisko'."
+    )
+    user = "KONTEXT:\n" + context_text[:12000] + "\n\nLISTA WZMIANEK:\n" + json.dumps(candidates, ensure_ascii=False)
+
+    resp = client.chat.completions.create(
+        model=MODEL,
+        temperature=0.0,
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}]
+    )
+    try:
+        data = json.loads(resp.choices[0].message.content)
+        out = {}
+        for it in data.get("items", []):
+            surface = it.get("surface", "")
+            year = it.get("year")
+            lemma = it.get("lemma", "")
+            conf = float(it.get("confidence", 0.0) or 0.0)
+            if not lemma or conf < 0.5:
+                continue
+            key = surface if not year else f"{surface}|{year}"
+            out[key] = {"lemma": lemma, "confidence": conf}
+        return out
+    except Exception:
+        return {}
+
+
+# ========== Wezwania do OpenAI: linkowanie i OCR ==========
+
+def call_openai_linker(
+    raw_text: str,
+    known_entities: Dict[str, List[str]],
+    temperature: float = 0.1,
+    person_map: Optional[Dict[str, Dict[str, str]]] = None
+) -> Tuple[str, List[Dict]]:
     """
     Zwraca (linked_text, entities_list)
-    known_entities: dict lemma -> list_of_known_surfaces (dla spójności)
+    person_map: np. {'J. Kowalski': {'lemma': 'Jan Kowalski'}, 'Kowalski|1953': {...}}
     """
     known_list = []
     for lemma, surfaces in known_entities.items():
@@ -185,7 +285,31 @@ def call_openai_linker(raw_text: str, known_entities: Dict[str, List[str]], temp
         else:
             known_list.append({"lemma": lemma, "surfaces": [surfaces]})
 
+    # wstrzyknięcie zasad dla osób
+    person_rules = []
+    if person_map:
+        for k, v in person_map.items():
+            if "|" in k:
+                surface, year = k.split("|", 1)
+            else:
+                surface, year = k, None
+            person_rules.append({
+                "surface": surface,
+                "year": year,
+                "lemma": v.get("lemma", "")
+            })
+
     sys = SYSTEM_PROMPT_BASE + json.dumps(known_list, ensure_ascii=False, indent=2)
+    sys += (
+        "\n\nDODATKOWE ZASADY DLA OSÓB (PERSON_RESOLVED):\n"
+        "- Jeśli w tekście znajdziesz poniższe powierzchnie (w tym formy z inicjałem lub samo nazwisko w cytowaniu z rokiem), "
+        "ZAWSZE linkuj do pełnego 'Imię Nazwisko' jako LEMMA i zachowaj powierzchnię jako alias po prawej stronie paska '|' "
+        "(np. [[Jan Kowalski | J. Kowalski]] lub [[Maria Curie | Curie]]).\n"
+        "- Nie poprawiaj treści poza dodaniem linku.\n"
+        "PERSON_RESOLVED:\n"
+    )
+    sys += json.dumps(person_rules, ensure_ascii=False, indent=2)
+
     messages = [
         {"role": "system", "content": sys},
         {"role": "user", "content": raw_text}
@@ -209,7 +333,6 @@ def call_openai_linker(raw_text: str, known_entities: Dict[str, List[str]], temp
     else:
         return content.strip(), []
 
-# ➕ NOWE: czyszczenie OCR/PDF (minimalne zmiany)
 def call_openai_cleaner(raw_text: str, temperature: float = 0.0) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT_OCR},
@@ -237,17 +360,11 @@ def update_known_entities(known: Dict[str, List[str]], new_items: List[Dict]) ->
             known[lemma].append(surface)
     return known
 
-def count_total_chunks(full_text: str) -> int:
-    segments = compound_protection(full_text)
-    total = 0
-    for seg, protected in segments:
-        if protected or not seg.strip():
-            continue
-        total += len(chunk_text_by_paragraphs(seg, MAX_CHARS_PER_CHUNK, CHUNK_OVERLAP))
-    return total
-
-# ➕ NOWE: samodzielny pipeline do oczyszczania OCR/PDF (bez mapy encji)
 def apply_ocr_cleanup(full_text: str, temperature: float = 0.0) -> str:
+    """
+    Samodzielny pipeline do oczyszczania OCR/PDF (bez mapy encji).
+    Chroni kod i linki, działa chunkami z overlapem.
+    """
     segments = compound_protection(full_text)
     out_segments = []
 
@@ -274,6 +391,10 @@ def apply_ocr_cleanup(full_text: str, temperature: float = 0.0) -> str:
     return "".join(out_segments)
 
 def process_text_with_map(full_text: str, temperature: float, initial_map: Dict[str, List[str]]) -> Tuple[str, Dict[str, List[str]]]:
+    """
+    Linkowanie z globalną mapą encji.
+    Dodatkowo: rozpoznawanie osób na poziomie segmentu (więcej kontekstu).
+    """
     segments = compound_protection(full_text)
     known_entities: Dict[str, List[str]] = {k: list(v) for k, v in (initial_map or {}).items()}
     out_segments = []
@@ -286,11 +407,17 @@ def process_text_with_map(full_text: str, temperature: float, initial_map: Dict[
         if protected or not seg.strip():
             out_segments.append(seg)
             continue
+
+        # Rozpoznanie osób na bazie całego segmentu
+        persons = call_openai_person_resolver(seg, extract_person_candidates(seg))
+
         chunks = chunk_text_by_paragraphs(seg, MAX_CHARS_PER_CHUNK, CHUNK_OVERLAP)
         processed_parts = []
         for ch in chunks:
             with st.spinner(f"Przetwarzam fragment {done_chunks + 1}/{total_chunks}…"):
-                linked, ents = call_openai_linker(ch, known_entities, temperature=temperature)
+                linked, ents = call_openai_linker(
+                    ch, known_entities, temperature=temperature, person_map=persons
+                )
                 processed_parts.append(linked)
                 known_entities = update_known_entities(known_entities, ents)
             done_chunks += 1
@@ -302,6 +429,10 @@ def process_text_with_map(full_text: str, temperature: float, initial_map: Dict[
     return "".join(out_segments), known_entities
 
 def process_text(full_text: str, temperature: float = 0.1) -> Tuple[str, Dict[str, List[str]]]:
+    """
+    Linkowanie bez wstępnej mapy; buduje mapę w locie.
+    Dodatkowo: rozpoznawanie osób na poziomie segmentu.
+    """
     segments = compound_protection(full_text)
     known_entities: Dict[str, List[str]] = {}
     out_segments = []
@@ -316,11 +447,16 @@ def process_text(full_text: str, temperature: float = 0.1) -> Tuple[str, Dict[st
             out_segments.append(seg)
             continue
 
+        # Rozpoznanie osób dla segmentu
+        persons = call_openai_person_resolver(seg, extract_person_candidates(seg))
+
         chunks = chunk_text_by_paragraphs(seg, MAX_CHARS_PER_CHUNK, CHUNK_OVERLAP)
         processed_parts = []
         for i, ch in enumerate(chunks, start=1):
             with st.spinner(f"Przetwarzam fragment {done_chunks + 1}/{total_chunks}…"):
-                linked, ents = call_openai_linker(ch, known_entities, temperature=temperature)
+                linked, ents = call_openai_linker(
+                    ch, known_entities, temperature=temperature, person_map=persons
+                )
                 processed_parts.append(linked)
                 known_entities = update_known_entities(known_entities, ents)
             done_chunks += 1
@@ -334,18 +470,18 @@ def process_text(full_text: str, temperature: float = 0.1) -> Tuple[str, Dict[st
     return "".join(out_segments), known_entities
 
 
-
 # ========== UI Streamlit ==========
+
 st.set_page_config(page_title="Obsidian Linker (PL)", page_icon="🧭", layout="wide")
 
 st.title("🧭 Obsidian Linker (PL)")
-st.caption("Automatyczne dodawanie linków [[ ]] i (opcjonalnie) minimalne czyszczenie artefaktów OCR/PDF bez redakcji.")
+st.caption("Automatyczne dodawanie linków [[ ]] i (opcjonalnie) minimalne czyszczenie artefaktów OCR/PDF + rozpoznawanie osób (inicjały/cytowania).")
 
 with st.sidebar:
     st.subheader("Ustawienia")
     temp = st.slider("Temperatura (0 = bardzo zachowawczo)", 0.0, 1.0, 0.1, 0.05, key="k_temp")
 
-    # ➕ NOWE: wybór trybu przetwarzania
+    # Tryb przetwarzania
     st.divider()
     mode = st.radio(
         "Tryb przetwarzania",
@@ -372,7 +508,8 @@ if sample:
     default_text = (
         "Pierwszym królem polskim goszczącym w Zamku Warszawskim był Władysław Jagiełło. "
         "W 1526 roku Zygmunt I przejął Mazowsze po śmierci książąt Janusza i Stanisława. "
-        "W 1569 roku Unia lubelska wyznaczyła Warszawę i Zamek na stałe miejsce obrad sejmu."
+        "W 1569 roku Unia lubelska wyznaczyła Warszawę i Zamek na stałe miejsce obrad sejmu. "
+        "Por. J. Kowalski (1953) i M. K. Pawlikowska."
     )
 
 input_text = st.text_area(
@@ -416,10 +553,8 @@ if run:
 
         for idx, sec in enumerate(sections, start=1):
             st.write(f"**Sekcja {idx}/{len(sections)}:** {sec['title']}")
-
             sec_content = sec["content"]
 
-            # ➕ NOWE: tryby OCR
             if mode == "Oczyść OCR/PDF (minimalnie)":
                 cleaned_text = apply_ocr_cleanup(sec_content, temperature=0.0)
                 section_results.append({
@@ -511,7 +646,7 @@ if run:
 
         if mode == "Oczyść OCR/PDF (minimalnie)":
             result_text = apply_ocr_cleanup(work_text, temperature=0.0)
-            new_map = {}
+            new_map: Dict[str, List[str]] = {}
         elif mode == "Oczyść OCR/PDF + dodaj linki":
             cleaned = apply_ocr_cleanup(work_text, temperature=0.0)
             result_text, new_map = process_text(cleaned, temperature=temp)
@@ -549,4 +684,4 @@ if run:
 
 else:
     st.info("Ustaw parametry, wklej tekst i kliknij **Przetwórz**. "
-            "Aplikacja doda linki i/lub minimalnie oczyści artefakty OCR/PDF.")
+            "Aplikacja doda linki i/lub minimalnie oczyści artefakty OCR/PDF. Rozpoznaje także osoby z inicjałów i cytowań „Nazwisko (rok)”.")
